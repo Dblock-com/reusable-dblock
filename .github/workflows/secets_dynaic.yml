@@ -1,0 +1,233 @@
+name: Reusable - Sync Secrets to AWS SM
+
+on:
+  workflow_call:
+    inputs:
+      aws-region:
+        description: 'AWS Region to sync secrets to'
+        required: true
+        type: string
+      secrets-to-ignore:
+        description: 'Space-separated list of GitHub secret names to NOT sync'
+        required: false
+        type: string
+        default: "github_token GITHUB_TOKEN"
+      secret-prefix:
+        description: 'Prefix for the secret name in AWS Secrets Manager (e.g., env/repo/branch/). Auto-calculated if empty.'
+        required: false
+        type: string
+        default: '' # Default to empty, will calculate below if needed
+      caller_variables_json:
+        description: 'A JSON string containing variables from the calling workflow vars context'
+        required: false
+        type: string
+        default: '{}'
+
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        description: 'AWS Access Key ID for IAM User'
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        description: 'AWS Secret Access Key for IAM User'
+        required: true
+
+jobs:
+  sync_secrets:
+    name: Sync Secrets to AWS SM
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ inputs.aws-region }}
+
+    steps:
+      - name: Configure AWS Credentials (IAM User)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # MODIFIED STEP: This step now filters secrets based on the branch name.
+      - name: Get & Filter Secret Names by Branch
+        id: get_names
+        env:
+          GITHUB_SECRETS_JSON: ${{ toJSON(secrets) }}
+          SECRETS_TO_IGNORE_INPUT: "${{ inputs.secrets-to-ignore }}"
+          # Reliably get the short branch/tag name from the caller's context.
+          # For a PR, it's the head_ref (source branch). For a push, it's the ref_name.
+          BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
+        run: |
+          echo "Determining branch/ref name for filtering..."
+          current_branch_name="${BRANCH_NAME}"
+          echo "Branch identified as: '$current_branch_name'"
+          if [ -z "$current_branch_name" ]; then
+            echo "::error::Could not determine branch name. Aborting."
+            exit 1
+          fi
+
+          echo "Extracting secret names from the secrets context..."
+          potential_names=$(echo "$GITHUB_SECRETS_JSON" | jq -r 'keys | . - ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"] | join(" ")')
+
+          if [ -z "$potential_names" ]; then
+            echo "No syncable secrets (other than AWS keys) were passed to this workflow."
+            echo "names_list=" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Potential secrets to sync (before filtering): $potential_names"
+          echo "Secrets to ignore via input list: $SECRETS_TO_IGNORE_INPUT"
+
+          filtered_names=""
+          # Convert branch name to lowercase once for case-insensitive comparison
+          branch_lower=$(echo "$current_branch_name" | tr '[:upper:]' '[:lower:]')
+
+          for name in $potential_names; do
+            # 1. Check against the explicit ignore list
+            if echo " $SECRETS_TO_IGNORE_INPUT " | grep -q " $name "; then
+              echo "-> Filtering out '$name': Found in ignore list."
+              continue
+            fi
+
+            # 2. Check if secret contains an underscore (required for environment prefixing)
+            if [[ "$name" != *"_"* ]]; then
+              echo "-> SKIPPING '$name': Does not contain '_' prefix for environment matching."
+              continue
+            fi
+
+            # 3. CORE LOGIC: Match secret prefix with branch name (case-insensitive)
+            secret_env_prefix="${name%%_*}" # Extract part before first '_'
+            prefix_lower=$(echo "$secret_env_prefix" | tr '[:upper:]' '[:lower:]') # Convert prefix to lower
+
+            if [[ "$prefix_lower" == "$branch_lower" ]]; then
+              # Check that the secret value is not empty before adding
+              secret_value_check=$(echo "$GITHUB_SECRETS_JSON" | jq -r --arg k "$name" '.[$k]')
+              if [ -n "$secret_value_check" ]; then
+                echo "-> MATCH: '$name' prefix matches branch '$current_branch_name'. Adding to sync list."
+                filtered_names="$filtered_names $name"
+              else
+                echo "-> Filtering out '$name': Value is empty in secrets context."
+              fi
+            else
+              echo "-> SKIPPING '$name': Prefix '$secret_env_prefix' does not match branch '$current_branch_name'."
+            fi
+          done
+
+          names_output=$(echo "$filtered_names" | awk '{$1=$1};1') # Trim whitespace
+          if [ -z "$names_output" ]; then
+             echo "No secrets remaining to sync for branch '$current_branch_name' after all filtering."
+          else
+             echo "Final list of secrets to sync: $names_output"
+          fi
+          echo "names_list=${names_output}" >> $GITHUB_OUTPUT
+
+      # UNCHANGED STEP: This part handles variables, not secrets. Logic is kept as-is.
+      - name: Loop Over Injected Variables
+        env:
+          VARS_JSON_FOR_LOOP: ${{ inputs.caller_variables_json }}
+        shell: bash
+        run: |
+          if [[ -z "$VARS_JSON_FOR_LOOP" || "$VARS_JSON_FOR_LOOP" == "{}" ]]; then
+            echo "No variables received via input; skipping variable sync."
+            exit 0
+          fi
+          secret_prefix="${{ inputs.secret-prefix }}"
+          if [ -z "$secret_prefix" ]; then
+            REPO_NAME=$(basename "${{ github.repository }}")
+            if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+              BRANCH_NAME="${{ github.head_ref }}"
+            else
+              BRANCH_NAME=$(echo "${{ github.ref }}" | sed -e "s|refs/heads/||" -e "s|refs/tags/||")
+            fi
+            secret_prefix="env/${REPO_NAME}/${BRANCH_NAME}/"
+            echo "Calculated prefix for variables: $secret_prefix"
+          else
+             echo "Using provided prefix for variables: $secret_prefix"
+          fi
+
+          echo "Starting VARIABLE sync process..."
+          sync_count=0
+          skip_count=0
+          echo "$VARS_JSON_FOR_LOOP" | jq -c 'to_entries[]' | while IFS= read -r entry; do
+            var_name=$(echo "$entry" | jq -r '.key')
+            var_value=$(echo "$entry" | jq -r '.value')
+            if [ -z "$var_name" ]; then
+              echo "Skipping sync for an entry with an empty name."
+              skip_count=$((skip_count + 1))
+              continue
+            fi
+            aws_secret_name="${secret_prefix}${var_name}"
+            echo "Attempting sync for VARIABLE: $var_name to $aws_secret_name"
+            if aws secretsmanager create-secret --name "$aws_secret_name" --secret-string "$var_value" --region "$AWS_REGION" --no-cli-pager; then
+              echo "Successfully created secret from VARIABLE: $aws_secret_name"
+              sync_count=$((sync_count + 1))
+            else
+              echo "Secret from VARIABLE $aws_secret_name might exist. Attempting update..."
+              if aws secretsmanager put-secret-value --secret-id "$aws_secret_name" --secret-string "$var_value" --region "$AWS_REGION" --no-cli-pager; then
+                echo "Successfully updated secret from VARIABLE: $aws_secret_name"
+                sync_count=$((sync_count + 1))
+              else
+                echo "ERROR: Failed to create or update secret from VARIABLE: $aws_secret_name."
+                skip_count=$((skip_count + 1))
+              fi
+            fi
+          done
+          echo "VARIABLE sync finished. Synced: $sync_count, Skipped/Failed: $skip_count."
+
+      # MODIFIED STEP: This step now strips the env prefix before creating the secret in AWS.
+      - name: Sync Filtered Secrets to AWS
+        env: ${{ secrets }}
+        run: |
+          echo "Starting secret sync process..."
+          names_to_sync="${{ steps.get_names.outputs.names_list }}"
+
+          if [ -z "$names_to_sync" ]; then
+            echo "No secrets to sync after filtering. Exiting."
+            exit 0
+          fi
+
+          secret_prefix="${{ inputs.secret-prefix }}"
+          if [ -z "$secret_prefix" ]; then
+            echo "Calculating default prefix for secrets..."
+            REPO_NAME=$(basename "${{ github.repository }}")
+            if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+              BRANCH_NAME="${{ github.head_ref }}"
+            else
+              BRANCH_NAME=$(echo "${{ github.ref }}" | sed -e "s|refs/heads/||" -e "s|refs/tags/||")
+            fi
+            secret_prefix="secret/${REPO_NAME}/${BRANCH_NAME}/"
+            echo "Calculated prefix for secrets: $secret_prefix"
+          else
+             echo "Using provided prefix for secrets: $secret_prefix"
+          fi
+
+          echo "Will attempt to sync secrets: $names_to_sync"
+          echo "Using AWS secret path prefix: $secret_prefix"
+
+          sync_count=0
+          skip_count=0
+          for secret_name_with_prefix in $names_to_sync; do
+            secret_value="${!secret_name_with_prefix}"
+
+            # NEW: Strip the environment prefix (e.g., 'dev_') from the name for a cleaner AWS secret.
+            # 'dev_DATABASE_URL' becomes 'DATABASE_URL'.
+            aws_secret_name="${secret_name_with_prefix#*_}"
+            full_aws_secret_path="${secret_prefix}${secret_name_with_prefix}"
+
+            echo "Attempting to sync GitHub secret '$secret_name_with_prefix' to AWS secret '$full_aws_secret_path'"
+
+            # Upsert logic: Try to create the secret; if it fails, assume it exists and update it.
+            if aws secretsmanager create-secret --name "$full_aws_secret_path" --secret-string "$secret_value" --region "$AWS_REGION" --no-cli-pager; then
+              echo "Successfully created secret: $full_aws_secret_path"
+              sync_count=$((sync_count + 1))
+            else
+              echo "Secret '$full_aws_secret_path' might already exist. Attempting update..."
+              if aws secretsmanager put-secret-value --secret-id "$full_aws_secret_path" --secret-string "$secret_value" --region "$AWS_REGION" --no-cli-pager; then
+                 echo "Successfully updated secret: $full_aws_secret_path"
+                 sync_count=$((sync_count + 1))
+              else
+                 echo "ERROR: Failed to create or update secret: $full_aws_secret_path. Check AWS permissions and logs."
+                 skip_count=$((skip_count + 1))
+              fi
+            fi
+          done
+
+          echo "Secret sync finished. Synced/Updated: $sync_count, Skipped/Failed: $skip_count. Check AWS Secrets Manager."

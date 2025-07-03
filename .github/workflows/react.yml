@@ -1,0 +1,209 @@
+# .github/workflows/reusable-react-s3-deploy.yml
+# Workflow name
+name: Reusable React Build and S3 Deploy (env from secrets)
+
+# --- Trigger ---
+# Makes this workflow reusable by other workflows
+on:
+  workflow_call:
+    # --- Inputs ---
+    inputs:
+      aws_region:
+        description: 'AWS region for the S3 bucket'
+        required: true
+        type: string
+      distribution_id:
+        description: "The Cloudfront distribution ID"
+        required: true
+        type: string
+      branch_name:
+        description: 'The branch name triggering the deployment'
+        required: true
+        type: string
+      repo_name:
+        description: 'The repository name'
+        required: true
+        type: string
+      build_output_dir:
+        description: 'Path to the built static files directory'
+        required: false
+        type: string
+        default: './build/'
+      node_version:
+        description: 'Node.js version for build'
+        required: false
+        type: string
+        default: '18.x'
+      install_command:
+        description: 'Command to install dependencies'
+        required: false
+        type: string
+        default: 'npm ci'
+      build_command:
+        description: 'Command to build the React application'
+        required: false
+        type: string
+        default: 'npm run build'
+      secrets_to_ignore:
+        description: 'Space-separated list of GitHub secret names to NOT include in the .env file'
+        required: false
+        type: string
+        default: "AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY GITHUB_TOKEN github_token"
+
+    # --- Secrets ---
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        description: 'AWS Access Key ID for S3 deployment'
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        description: 'AWS Secret Access Key for S3 deployment'
+        required: true
+
+# --- Jobs ---
+jobs:
+  build-and-deploy:
+    name: Build and Deploy to S3
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Check out repository code
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Step 2: Set up Node.js environment
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: 'npm'
+
+      # Step 3: Create .env file from inherited secrets (using env + filtering)
+# Step 3: Create .env file from inherited secrets (using env + filtering)
+      - name: Step 1 - Get All Secret Names
+        id: get_names
+        # Use the toJSON context function to get all secrets as a JSON string.
+        # This is stored in an environment variable GITHUB_SECRETS_JSON.
+        env:
+          GITHUB_SECRETS_JSON: ${{ toJSON(secrets) }}
+        run: |
+          echo "Extracting all available secret names..."
+          names_output="" # Default to empty string
+
+          # Check if the secrets JSON is not empty or just '{}'
+          if [ -n "$GITHUB_SECRETS_JSON" ] && [ "$GITHUB_SECRETS_JSON" != "{}" ]; then
+            # Use jq (a lightweight JSON processor) to extract the keys (secret names)
+            # and join them into a single space-separated string.
+            # The '-r' flag outputs raw strings without quotes.
+            names_output=$(echo "$GITHUB_SECRETS_JSON" | jq -r 'keys | join(" ")')
+            echo "Found secret names."
+          else
+            echo "No secrets found or secrets context is empty."
+          fi
+
+          # Set the output variable 'names_list' for the next step using GitHub Actions output syntax.
+          echo "names_list=${names_output}" >> $GITHUB_OUTPUT
+          echo "Outputting names_list: ${names_output}" # Log the names being passed
+
+      - name: Step 2 - Write Secrets to .env File (Applying Ignore List)
+        # Populate the step's environment with all secrets.
+        # WARNING: This relies on potentially undocumented or unstable behavior.
+        env: ${{ secrets }}
+        # Pass the input ignore list as an environment variable to the script
+        # Use inputs context for workflow_dispatch/workflow_call
+        # If not using inputs, you might define this at the job level:
+        # env:
+        #   SECRETS_TO_IGNORE: "SOME_SECRET ANOTHER_SECRET" # Example hardcoded list
+        #   ${{ secrets }} # Still need this to populate other secrets
+        run: |
+          echo "Starting process to write secrets to .env file..."
+          # Get the list of secret names from the previous step's output.
+          names_to_write="${{ steps.get_names.outputs.names_list }}"
+          # Get the ignore list from the input (passed via env var for script access)
+          ignore_list="${{ inputs.secrets_to_ignore }}" # Access the input directly
+
+          echo "Secrets to potentially write: $names_to_write"
+          echo "Secrets to ignore: $ignore_list"
+
+          # Check if any names were actually passed from Step 1.
+          if [ -z "$names_to_write" ]; then
+            echo "No secret names found in the previous step. Skipping .env file creation."
+            exit 0 # Exit successfully as there's nothing to write
+          fi
+
+          # Ensure the .env file is empty before starting
+          > .env
+          echo "Created/Cleared .env file."
+
+          # Loop through each secret name obtained from Step 1.
+          for secret_name in $names_to_write; do
+
+            # --- Ignore List Check ---
+            # Check if the ignore list is not empty AND if the current secret_name exists within it.
+            # We pad both the list and the name with spaces for safer whole-word matching.
+            # grep -q returns 0 (success/true in shell terms) if found.
+            if [ -n "$ignore_list" ] && echo " $ignore_list " | grep -q " $secret_name "; then
+              echo "Skipping: $secret_name (found in ignore list)"
+              continue # Skip to the next secret name in the loop
+            fi
+            # --- End Ignore List Check ---
+
+            # Use BASH indirect expansion (!variable_name) to get the value
+            # of the environment variable whose name is stored in 'secret_name'.
+            secret_value="${!secret_name}"
+
+            # Check if the secret value is actually empty or if the environment variable
+            # for this secret name wasn't populated.
+            if [ -z "$secret_value" ]; then
+                echo "Skipping: $secret_name (Value is empty OR env var not populated)"
+                continue # Skip to the next secret name in the loop
+            fi
+
+            echo "Writing $secret_name to .env file..."
+            # Append the secret name and its value to the .env file.
+            echo "${secret_name}=${secret_value}" >> .env
+
+          done
+
+          echo ".env file generation complete."
+          echo "Contents of .env:"
+          # Be cautious logging .env contents if they are sensitive
+          cat .env        # Step 4: Install project dependencies
+          pwd
+          ls -al
+      - name: Install dependencies
+        run: ${{ inputs.install_command }}
+
+      # Step 5: Build the React application
+      - name: Build React application
+        run: |
+          ls -al
+          ${{ inputs.build_command }}
+
+      # Step 6: Configure AWS Credentials
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ inputs.aws_region }}
+
+      # Step 7: Deploy static files to S3 bucket
+      - name: Deploy static site to S3 bucket
+        env: 
+          DISTRIBUTION_ID: ${{inputs.distribution_id}}
+        run: |
+          echo "Preparing deployment..."
+          echo "Using build output directory: ${{ inputs.build_output_dir }}"
+          BRANCH_NAME=$(echo "${{ inputs.branch_name }}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')
+          REPO_NAME_LOWER=$(echo "${{ inputs.repo_name }}" | tr '[:upper:]' '[:lower:]')
+          REGION_LOWER=$(echo "${{ inputs.aws_region }}" | tr '[:upper:]' '[:lower:]')
+          BUCKET_NAME="${BRANCH_NAME}-${REPO_NAME_LOWER}-${REGION_LOWER}-static-s3"
+          echo "Target S3 Bucket: s3://${BUCKET_NAME}"
+          if [ ! -d "${{ inputs.build_output_dir }}" ]; then
+            echo "Error: Build output directory '${{ inputs.build_output_dir }}' not found!"
+            exit 1
+          fi
+          aws s3 sync ${{ inputs.build_output_dir }} "s3://${BUCKET_NAME}" --delete
+          echo "invalidation caching"
+          aws cloudfront create-invalidation --distribution-id $DISTRIBUTION_ID --paths "/*"
+          echo "Deployment to s3://${BUCKET_NAME} completed."
